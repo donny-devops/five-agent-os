@@ -53,6 +53,8 @@ class PromptManifestError(ValueError):
 
 def _parse_scalar(value: str) -> Any:
     value = value.strip()
+    if value == "[]":
+        return []
     if value in {"true", "false"}:
         return value == "true"
     if value.startswith('"') and value.endswith('"'):
@@ -90,6 +92,10 @@ def load_simple_yaml(path: Path) -> dict[str, Any]:
                 block.append(lines[i][2:] if lines[i].startswith("  ") else "")
                 i += 1
             data[key] = "\n".join(block).rstrip() + "\n"
+            continue
+        if value == "[]":
+            data[key] = []
+            i += 1
             continue
         if value == "":
             items: list[str] = []
@@ -134,12 +140,20 @@ def load_policy_registry(path: Path = POLICY_REGISTRY_PATH) -> list[PolicyRule]:
     return [PolicyRule(**rule) for rule in payload["rules"]]
 
 
+def _matches_policy_pattern(pattern: str, text: str) -> bool:
+    """Check if *pattern* matches *text* with word boundary awareness."""
+    lead = r"\b" if re.match(r"^\w", pattern) else ""
+    trail = r"\b" if re.search(r"\w$", pattern) else ""
+    regex = rf"{lead}{pattern}{trail}"
+    return bool(re.search(regex, text, flags=re.IGNORECASE))
+
+
 def apply_guardrails(text: str, policies: list[PolicyRule] | None = None) -> GuardrailResult:
     rules = policies if policies is not None else load_policy_registry()
     triggered: list[dict[str, str]] = []
     for rule in rules:
         for pattern in rule.patterns:
-            if re.search(pattern, text, flags=re.IGNORECASE):
+            if _matches_policy_pattern(pattern, text):
                 triggered.append(
                     {
                         "policy_id": rule.policy_id,
@@ -248,13 +262,17 @@ def evaluate_request(user_request: str) -> dict[str, Any]:
     }
 
 
-def scrub_sensitive_fields(payload: dict[str, Any]) -> dict[str, Any]:
-    sensitive_keys = {"api_key", "password", "token", "secret", "credential"}
+SENSITIVE_KEY_PATTERN = re.compile(
+    r"(api[_-]?key|password|secret|token|credential|private[_-]?key)",
+    re.IGNORECASE,
+)
 
+
+def scrub_sensitive_fields(payload: dict[str, Any]) -> dict[str, Any]:
     def walk(value: Any) -> Any:
         if isinstance(value, dict):
             return {
-                key: "[REDACTED]" if key.lower() in sensitive_keys else walk(item)
+                key: "[REDACTED]" if SENSITIVE_KEY_PATTERN.search(key) else walk(item)
                 for key, item in value.items()
             }
         if isinstance(value, list):

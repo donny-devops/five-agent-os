@@ -6,6 +6,7 @@ from src.multi_agent_os.prompt_control import (
     evaluate_request,
     load_eval_fixtures,
     load_manifests,
+    load_simple_yaml,
     render_prompt_snapshot,
     score_telemetry,
     scrub_sensitive_fields,
@@ -82,3 +83,39 @@ def test_sensitive_field_scrubbing() -> None:
 
 def test_manifest_directory_exists() -> None:
     assert Path(PROMPT_MANIFEST_DIR).exists()
+
+
+def test_guardrail_word_boundary_no_false_positive_secretary() -> None:
+    # "secret" rule should not match "secretary"
+    result = apply_guardrails("Please forward this request to my executive secretary.")
+    assert not result.triggered
+    assert result.human_review_required is False
+
+
+def test_sensitive_field_scrubbing_camel_and_compound() -> None:
+    payload = {
+        "apiKey": "sensitive1",
+        "client_secret": "sensitive2",
+        "accessToken": "sensitive3",
+        "refreshToken": "sensitive4",
+        "private_key": "sensitive5",
+        "credentials": {"sub_token": "sensitive6"},
+        "user_name": "normal_user",
+    }
+    scrubbed = scrub_sensitive_fields(payload)
+    assert scrubbed["apiKey"] == "[REDACTED]"
+    assert scrubbed["client_secret"] == "[REDACTED]"
+    assert scrubbed["accessToken"] == "[REDACTED]"
+    assert scrubbed["refreshToken"] == "[REDACTED]"
+    assert scrubbed["private_key"] == "[REDACTED]"
+    assert scrubbed["credentials"] == "[REDACTED]"
+    assert scrubbed["user_name"] == "normal_user"
+
+
+def test_load_simple_yaml_empty_list(tmp_path: Path) -> None:
+    yaml_file = tmp_path / "test.yaml"
+    yaml_file.write_text("name: Test\nitems: []\n", encoding="utf-8")
+    data = load_simple_yaml(yaml_file)
+    assert data["name"] == "Test"
+    assert data["items"] == []
+    assert isinstance(data["items"], list)

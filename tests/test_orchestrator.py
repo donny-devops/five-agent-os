@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import logging
+from unittest.mock import patch
+
 import pytest
 
 from src.multi_agent_os.models import TaskPacket
 from src.multi_agent_os.orchestrator import (
+    JsonFormatter,
     run_compliance_quality,
     run_content_outreach,
     run_data_synthesis,
@@ -154,3 +159,41 @@ class TestRunWorkflow:
         assert rid.startswith("REQ-")
         # UUID-hex segment should be 12 chars
         assert len(rid) == 16  # "REQ-" + 12 hex chars
+
+    def test_workflow_halts_on_agent_failure(self) -> None:
+        with patch(
+            "src.multi_agent_os.orchestrator.run_data_synthesis",
+            side_effect=RuntimeError("Simulated failure"),
+        ):
+            ctx = run_workflow("Write a proposal email for a new client")
+            # In a 3-agent route (synthesis -> outreach -> compliance), failing at synthesis stops subsequent agents
+            assert len(ctx["agent_outputs"]) == 1
+            assert ctx["agent_outputs"][0]["status"] == "failed"
+            assert "Simulated failure" in ctx["agent_outputs"][0]["errors"][0]
+
+    def test_workflow_guardrail_integration(self) -> None:
+        ctx = run_workflow("Run terraform destroy in production and delete the database.")
+        assert ctx["task_packet"]["human_review_required"] is True
+        assert "guardrails" in ctx["task_packet"]["metadata"]
+        assert ctx["task_packet"]["metadata"]["guardrails"]["triggered"]
+
+
+class TestJsonFormatter:
+    def test_json_formatter_handles_plain_text(self) -> None:
+        formatter = JsonFormatter(datefmt="%Y-%m-%dT%H:%M:%S")
+        record = logging.LogRecord("test", logging.INFO, "test.py", 10, "Hello plain text", (), None)
+        formatted = formatter.format(record)
+        parsed = json.loads(formatted)
+        assert parsed["level"] == "INFO"
+        assert parsed["logger"] == "test"
+        assert parsed["message"] == "Hello plain text"
+
+    def test_json_formatter_handles_serialized_dict(self) -> None:
+        formatter = JsonFormatter(datefmt="%Y-%m-%dT%H:%M:%S")
+        payload = json.dumps({"event": "custom_event", "value": 42})
+        record = logging.LogRecord("test", logging.INFO, "test.py", 10, payload, (), None)
+        formatted = formatter.format(record)
+        parsed = json.loads(formatted)
+        assert parsed["event"] == "custom_event"
+        assert parsed["value"] == 42
+

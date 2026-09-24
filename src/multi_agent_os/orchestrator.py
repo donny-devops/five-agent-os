@@ -9,17 +9,44 @@ from collections.abc import Callable
 from typing import Any, TypeVar
 
 from .models import AgentOutput, TaskPacket, generate_request_id
+from .prompt_control import apply_guardrails
 from .router import create_task_packet
+
 
 # ---------------------------------------------------------------------------
 # Structured JSON logger
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format='{"time": "%(asctime)s", "level": "%(levelname)s", "logger": "%(name)s", "message": %(message)s}',
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
+class JsonFormatter(logging.Formatter):
+    """Formats log records as valid JSON objects."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        record_dict: dict[str, Any] = {
+            "time": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+        }
+        msg = record.getMessage()
+        try:
+            parsed = json.loads(msg)
+            if isinstance(parsed, dict):
+                record_dict.update(parsed)
+            else:
+                record_dict["message"] = parsed
+        except (json.JSONDecodeError, TypeError):
+            record_dict["message"] = msg
+
+        if record.exc_info:
+            record_dict["exception"] = self.formatException(record.exc_info)
+        return json.dumps(record_dict)
+
+
 log = logging.getLogger("multi_agent_os.orchestrator")
+if not log.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(JsonFormatter(datefmt="%Y-%m-%dT%H:%M:%S"))
+    log.addHandler(_handler)
+    log.setLevel(logging.INFO)
+    log.propagate = False
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -41,10 +68,14 @@ def retry(max_attempts: int = 3, base_delay: float = 0.5) -> Callable[[F], F]:
                     if attempt == max_attempts:
                         raise
                     log.warning(
-                        '{"event": "retry", "fn": "%s", "attempt": %d, "error": "%s"}',
-                        fn.__name__,
-                        attempt,
-                        exc,
+                        json.dumps(
+                            {
+                                "event": "retry",
+                                "fn": fn.__name__,
+                                "attempt": attempt,
+                                "error": str(exc),
+                            }
+                        )
                     )
                     time.sleep(delay)
                     delay *= 2
@@ -69,21 +100,29 @@ def _timed_agent(
         result = fn(*args)
         result.duration_ms = round((time.monotonic() - t0) * 1000, 2)
         log.info(
-            '{"event": "agent_complete", "request_id": "%s", "agent": "%s", "status": "%s", "duration_ms": %s}',
-            request_id,
-            agent_name,
-            result.status,
-            result.duration_ms,
+            json.dumps(
+                {
+                    "event": "agent_complete",
+                    "request_id": request_id,
+                    "agent": agent_name,
+                    "status": result.status,
+                    "duration_ms": result.duration_ms,
+                }
+            )
         )
         return result
     except Exception as exc:  # noqa: BLE001
         duration_ms = round((time.monotonic() - t0) * 1000, 2)
         log.error(
-            '{"event": "agent_error", "request_id": "%s", "agent": "%s", "error": "%s", "duration_ms": %s}',
-            request_id,
-            agent_name,
-            exc,
-            duration_ms,
+            json.dumps(
+                {
+                    "event": "agent_error",
+                    "request_id": request_id,
+                    "agent": agent_name,
+                    "error": str(exc),
+                    "duration_ms": duration_ms,
+                }
+            )
         )
         return AgentOutput(
             request_id=request_id,
@@ -236,12 +275,27 @@ async def run_workflow_async(user_request: str) -> dict[str, Any]:
     """Run the five-agent pipeline asynchronously."""
     request_id = generate_request_id()
     task = create_task_packet(request_id, user_request, metadata={"source": "local_demo"})
+
+    # Evaluate request against safety and policy guardrails
+    guardrail = apply_guardrails(user_request)
+    if not guardrail.allowed or guardrail.human_review_required:
+        task.human_review_required = True
+    if guardrail.triggered:
+        task.metadata["guardrails"] = {
+            "allowed": guardrail.allowed,
+            "triggered": guardrail.triggered,
+        }
+
     context: dict[str, Any] = {"task_packet": task.to_dict(), "agent_outputs": []}
 
     log.info(
-        '{"event": "workflow_start", "request_id": "%s", "route": %s}',
-        request_id,
-        json.dumps(task.route),
+        json.dumps(
+            {
+                "event": "workflow_start",
+                "request_id": request_id,
+                "route": task.route,
+            }
+        )
     )
 
     _AGENT_DISPATCH: dict[str, Callable[..., AgentOutput]] = {
@@ -251,6 +305,7 @@ async def run_workflow_async(user_request: str) -> dict[str, Any]:
         "compliance_quality_agent": lambda: run_compliance_quality(task, context),
     }
 
+    loop = asyncio.get_running_loop()
     for agent_name in task.route:
         fn = _AGENT_DISPATCH.get(agent_name)
         if fn is None:
@@ -262,16 +317,32 @@ async def run_workflow_async(user_request: str) -> dict[str, Any]:
                 errors=[f"Unknown agent: {agent_name}"],
             )
         else:
-            result = await asyncio.get_event_loop().run_in_executor(
+            result = await loop.run_in_executor(
                 None,
                 lambda _fn=fn, _name=agent_name: _timed_agent(_fn, agent_name=_name, request_id=request_id),
             )
         context["agent_outputs"].append(result.to_dict())
+        if result.status == "failed":
+            log.error(
+                json.dumps(
+                    {
+                        "event": "workflow_aborted",
+                        "request_id": request_id,
+                        "failed_agent": agent_name,
+                        "reason": "Agent execution failed; halting downstream pipeline",
+                    }
+                )
+            )
+            break
 
     log.info(
-        '{"event": "workflow_complete", "request_id": "%s", "agents_run": %d}',
-        request_id,
-        len(context["agent_outputs"]),
+        json.dumps(
+            {
+                "event": "workflow_complete",
+                "request_id": request_id,
+                "agents_run": len(context["agent_outputs"]),
+            }
+        )
     )
     return context
 
