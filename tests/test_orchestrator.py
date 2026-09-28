@@ -196,4 +196,3 @@ class TestJsonFormatter:
         parsed = json.loads(formatted)
         assert parsed["event"] == "custom_event"
         assert parsed["value"] == 42
-

@@ -70,7 +70,7 @@ The project targets Python 3.11+ and enforces rule sets `E`, `W`, `F`, `I`, `B`,
    ```python
    @retry()
    def run_your_agent(task: TaskPacket, context: dict[str, Any]) -> AgentOutput:
-       output = { ... }
+       output = {...}
        return AgentOutput(task.request_id, "your_agent", "success", output, "medium")
    ```
 
