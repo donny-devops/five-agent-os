@@ -10,15 +10,20 @@ from pathlib import Path
 # Allow running from repo root
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from multi_agent_os.feedback import correction_rate, load_recent_corrections
+from multi_agent_os.feedback import (
+    correction_rate,
+    export_preference_pairs,
+    load_recent_corrections,
+)
 
 
 def main() -> None:
     stats = correction_rate()
+    pairs = export_preference_pairs()
     print("=== Feedback Loop Report ===")
     print(json.dumps(stats, indent=2))
-    print()
-    print("Recent corrections (last 5):")
+    print(f"\nDPO preference pairs available: {len(pairs)}")
+    print("\nRecent corrections (last 5):")
     for rec in load_recent_corrections(limit=5):
         print(
             f"- {rec.get('timestamp')} | {rec.get('agent')} | "
