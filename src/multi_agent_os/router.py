@@ -141,12 +141,14 @@ def create_task_packet(
 ) -> TaskPacket:
     """Parse *user_request* and return a fully-populated TaskPacket."""
     rid = (request_id or "").strip()
-    if not rid:
-        raise ValueError("request_id must be a non-empty string")
+    if not rid or len(rid) > 128 or any(ch.isspace() or ord(ch) < 32 for ch in rid):
+        raise ValueError("request_id must be a single-line token up to 128 characters")
 
     normalized = normalize_request(user_request)
     if not normalized:
         raise ValueError("user_request must be a non-empty string")
+    if len(normalized) > 8000:
+        raise ValueError("user_request exceeds 8000 characters")
 
     work_types = detect_work_types(normalized)
     risk_level, human_review = detect_risk(normalized)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from src.multi_agent_os.router import (
     build_route,
     create_task_packet,
@@ -158,3 +160,12 @@ class TestCreateTaskPacket:
         tp = create_task_packet("REQ-006", "Build a new dashboard")
         assert tp.version is not None
         assert len(tp.version) > 0
+
+
+    def test_rejects_multiline_request_id(self) -> None:
+        with pytest.raises(ValueError, match="request_id"):
+            create_task_packet("bad\nid", "Build an API workflow")
+
+    def test_rejects_oversized_request(self) -> None:
+        with pytest.raises(ValueError, match="8000"):
+            create_task_packet("REQ-009", "a" * 8001)
