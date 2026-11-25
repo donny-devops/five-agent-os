@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable
 from typing import Any, TypeVar
 
+from .feedback import load_recent_corrections
 from .models import AgentOutput, TaskPacket, generate_request_id
 from .prompt_control import apply_guardrails
 from .router import create_task_packet
@@ -138,7 +139,7 @@ def _timed_agent(
 # Individual agent functions
 # ---------------------------------------------------------------------------
 @retry()
-def run_data_synthesis(task: TaskPacket) -> AgentOutput:
+def run_data_synthesis(task: TaskPacket, examples: list[dict[str, Any]] | None = None) -> AgentOutput:
     output = {
         "summary": task.objective,
         "key_facts": [task.original_request],
@@ -159,6 +160,7 @@ def run_data_synthesis(task: TaskPacket) -> AgentOutput:
         "assumptions": ["No external source material was provided."],
         "confidence": "medium",
         "recommended_next_agent": task.route[1] if len(task.route) > 1 else "compliance_quality_agent",
+        "few_shot_examples": examples or [],
     }
     return AgentOutput(task.request_id, "data_synthesis_agent", "success", output, "medium")
 
@@ -272,11 +274,7 @@ def run_compliance_quality(task: TaskPacket, context: dict[str, Any]) -> AgentOu
 # Human-in-the-loop gate (primary pattern: sequential pipeline + HITL)
 # ---------------------------------------------------------------------------
 def _hitl_gate(task: TaskPacket, context: dict[str, Any]) -> bool:
-    """Return True if the pipeline should pause for human review.
-
-    This is the explicit gate for the sequential pipeline pattern.
-    When True, downstream delivery is blocked until a human approves.
-    """
+    """Return True if the pipeline should pause for human review."""
     if task.human_review_required:
         log.warning(
             json.dumps(
@@ -301,7 +299,7 @@ def _hitl_gate(task: TaskPacket, context: dict[str, Any]) -> bool:
 # Async workflow runner
 # ---------------------------------------------------------------------------
 async def run_workflow_async(user_request: str) -> dict[str, Any]:
-    """Run the five-agent sequential pipeline with an explicit HITL gate."""
+    """Run the five-agent sequential pipeline with HITL gate and feedback retrieval."""
     request_id = generate_request_id()
     task = create_task_packet(request_id, user_request, metadata={"source": "local_demo"})
 
@@ -315,7 +313,13 @@ async def run_workflow_async(user_request: str) -> dict[str, Any]:
             "triggered": guardrail.triggered,
         }
 
-    context: dict[str, Any] = {"task_packet": task.to_dict(), "agent_outputs": []}
+    # Retrieval step: pull recent human corrections before specialists run
+    few_shot = load_recent_corrections(limit=3)
+    context: dict[str, Any] = {
+        "task_packet": task.to_dict(),
+        "agent_outputs": [],
+        "few_shot_examples": few_shot,
+    }
 
     log.info(
         json.dumps(
@@ -323,13 +327,14 @@ async def run_workflow_async(user_request: str) -> dict[str, Any]:
                 "event": "workflow_start",
                 "request_id": request_id,
                 "route": task.route,
-                "pattern": "router → sequential pipeline + HITL gate",
+                "pattern": "router → sequential pipeline + HITL + feedback retrieval",
+                "few_shot_count": len(few_shot),
             }
         )
     )
 
     _AGENT_DISPATCH: dict[str, Callable[..., AgentOutput]] = {
-        "data_synthesis_agent": lambda: run_data_synthesis(task),
+        "data_synthesis_agent": lambda: run_data_synthesis(task, few_shot),
         "decision_making_agent": lambda: run_decision_making(task, context),
         "content_outreach_agent": lambda: run_content_outreach(task, context),
         "compliance_quality_agent": lambda: run_compliance_quality(task, context),
@@ -337,9 +342,7 @@ async def run_workflow_async(user_request: str) -> dict[str, Any]:
 
     loop = asyncio.get_running_loop()
     for agent_name in task.route:
-        # Explicit HITL gate before the final compliance/delivery step
         if agent_name == "compliance_quality_agent" and _hitl_gate(task, context):
-            # Still run compliance so the report is available, but mark the gate
             pass
 
         fn = _AGENT_DISPATCH.get(agent_name)
@@ -370,7 +373,6 @@ async def run_workflow_async(user_request: str) -> dict[str, Any]:
             )
             break
 
-    # Final HITL status on the context
     if task.human_review_required:
         context["status"] = "paused_for_human_review"
     else:
