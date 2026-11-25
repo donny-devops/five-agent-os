@@ -66,9 +66,17 @@ class RouteResult:
     is_hard_route: bool = True  # False when falling back to default
 
 
+def normalize_request(text: str) -> str:
+    """Collapse whitespace and strip leading/trailing space."""
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
 def detect_work_types(text: str) -> list[str]:
     """Return every work-type category whose keywords appear in *text*."""
-    lowered = text.lower()
+    lowered = normalize_request(text).lower()
+    if not lowered:
+        return ["unknown"]
+
     found: list[str] = []
     for work_type, keywords in WORK_TYPE_KEYWORDS.items():
         if any(re.search(rf"\b{re.escape(keyword)}\b", lowered) for keyword in keywords):
@@ -78,7 +86,9 @@ def detect_work_types(text: str) -> list[str]:
 
 def detect_risk(text: str) -> tuple[str, bool]:
     """Return (risk_level, human_review_required)."""
-    lowered = text.lower()
+    lowered = normalize_request(text).lower()
+    if not lowered:
+        return "medium", False
     if any(re.search(rf"\b{re.escape(term)}\b", lowered) for term in HIGH_RISK_TERMS):
         return "high", True
     return "medium", False
@@ -130,11 +140,15 @@ def create_task_packet(
     metadata: dict[str, Any] | None = None,
 ) -> TaskPacket:
     """Parse *user_request* and return a fully-populated TaskPacket."""
-    work_types = detect_work_types(user_request)
-    risk_level, human_review = detect_risk(user_request)
+    normalized = normalize_request(user_request)
+    if not normalized:
+        raise ValueError("user_request must be a non-empty string")
+
+    work_types = detect_work_types(normalized)
+    risk_level, human_review = detect_risk(normalized)
     route_result = build_route(work_types)
 
-    objective = user_request.strip().rstrip(".")
+    objective = normalized.rstrip(".")
     if not objective.lower().startswith(
         ("create", "build", "draft", "analyze", "decide", "review", "summarize")
     ):
@@ -149,7 +163,7 @@ def create_task_packet(
 
     return TaskPacket(
         request_id=request_id,
-        original_request=user_request,
+        original_request=normalized,
         objective=objective,
         work_type=work_types,
         priority="normal",
