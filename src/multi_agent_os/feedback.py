@@ -25,6 +25,7 @@ class FeedbackRecord:
     rating: int | None = None
     comment: str | None = None
     work_types: list[str] | None = None
+    original_request: str | None = None
     timestamp: str = ""
 
     def __post_init__(self) -> None:
@@ -61,6 +62,42 @@ def load_recent_corrections(
                 corrections.append(rec)
 
     return corrections[-limit:]
+
+
+def export_preference_pairs(path: Path = FEEDBACK_PATH) -> list[dict[str, Any]]:
+    """Turn human edits into DPO-style preference pairs.
+
+    Each pair is:
+      {
+        "prompt": original request or request_id,
+        "chosen": corrected_output,
+        "rejected": original_output
+      }
+    """
+    pairs: list[dict[str, Any]] = []
+    if not path.exists():
+        return pairs
+
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("human_action") == "edited" and rec.get("corrected_output"):
+                pairs.append(
+                    {
+                        "prompt": rec.get("original_request") or rec.get("request_id"),
+                        "chosen": rec["corrected_output"],
+                        "rejected": rec.get("original_output"),
+                        "agent": rec.get("agent"),
+                        "comment": rec.get("comment"),
+                    }
+                )
+    return pairs
 
 
 def correction_rate(path: Path = FEEDBACK_PATH) -> dict[str, Any]:
