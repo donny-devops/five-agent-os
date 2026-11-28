@@ -6,12 +6,57 @@ import json
 import logging
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import Any, TypeVar
 
 from .feedback import load_recent_corrections
 from .models import AgentOutput, TaskPacket, generate_request_id
 from .prompt_control import apply_guardrails
 from .router import create_task_packet
+
+# ---------------------------------------------------------------------------
+# Optional OpenTelemetry instrumentation
+# ---------------------------------------------------------------------------
+try:
+    from opentelemetry import trace
+    from opentelemetry.trace import Status, StatusCode
+
+    _TRACER = trace.get_tracer("multi_agent_os.orchestrator")
+    _OTEL_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _TRACER = None
+    _OTEL_AVAILABLE = False
+    Status = None  # type: ignore[assignment]
+    StatusCode = None  # type: ignore[assignment]
+
+
+class _NoOpSpan:
+    """Context-manager stand-in used when OpenTelemetry is not installed."""
+
+    def __enter__(self) -> _NoOpSpan:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        return None
+
+    def set_status(self, status: Any) -> None:
+        return None
+
+    def record_exception(self, exception: BaseException) -> None:
+        return None
+
+
+@contextmanager
+def _start_span(name: str, attributes: dict[str, Any] | None = None):
+    """Start an OTEL span if available; otherwise yield a no-op span."""
+    if _OTEL_AVAILABLE and _TRACER is not None:
+        with _TRACER.start_as_current_span(name, attributes=attributes or {}) as span:
+            yield span
+    else:
+        yield _NoOpSpan()
 
 
 # ---------------------------------------------------------------------------
@@ -96,43 +141,58 @@ def _timed_agent(
     request_id: str,
 ) -> AgentOutput:
     """Call *fn*, record wall-clock duration, handle exceptions gracefully."""
-    t0 = time.monotonic()
-    try:
-        result = fn(*args)
-        result.duration_ms = round((time.monotonic() - t0) * 1000, 2)
-        log.info(
-            json.dumps(
-                {
-                    "event": "agent_complete",
-                    "request_id": request_id,
-                    "agent": agent_name,
-                    "status": result.status,
-                    "duration_ms": result.duration_ms,
-                }
+    with _start_span(
+        f"agent.{agent_name}",
+        attributes={
+            "request_id": request_id,
+            "agent.name": agent_name,
+        },
+    ) as span:
+        t0 = time.monotonic()
+        try:
+            result = fn(*args)
+            result.duration_ms = round((time.monotonic() - t0) * 1000, 2)
+            span.set_attribute("agent.status", result.status)
+            span.set_attribute("agent.duration_ms", result.duration_ms)
+            if _OTEL_AVAILABLE and Status is not None and StatusCode is not None:
+                span.set_status(Status(StatusCode.OK))
+            log.info(
+                json.dumps(
+                    {
+                        "event": "agent_complete",
+                        "request_id": request_id,
+                        "agent": agent_name,
+                        "status": result.status,
+                        "duration_ms": result.duration_ms,
+                    }
+                )
             )
-        )
-        return result
-    except Exception as exc:  # noqa: BLE001
-        duration_ms = round((time.monotonic() - t0) * 1000, 2)
-        log.error(
-            json.dumps(
-                {
-                    "event": "agent_error",
-                    "request_id": request_id,
-                    "agent": agent_name,
-                    "error": str(exc),
-                    "duration_ms": duration_ms,
-                }
+            return result
+        except Exception as exc:  # noqa: BLE001
+            duration_ms = round((time.monotonic() - t0) * 1000, 2)
+            span.set_attribute("agent.duration_ms", duration_ms)
+            span.record_exception(exc)
+            if _OTEL_AVAILABLE and Status is not None and StatusCode is not None:
+                span.set_status(Status(StatusCode.ERROR, str(exc)))
+            log.error(
+                json.dumps(
+                    {
+                        "event": "agent_error",
+                        "request_id": request_id,
+                        "agent": agent_name,
+                        "error": str(exc),
+                        "duration_ms": duration_ms,
+                    }
+                )
             )
-        )
-        return AgentOutput(
-            request_id=request_id,
-            agent_name=agent_name,
-            status="failed",
-            output={},
-            errors=[str(exc)],
-            duration_ms=duration_ms,
-        )
+            return AgentOutput(
+                request_id=request_id,
+                agent_name=agent_name,
+                status="failed",
+                output={},
+                errors=[str(exc)],
+                duration_ms=duration_ms,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -321,74 +381,92 @@ async def run_workflow_async(user_request: str) -> dict[str, Any]:
         "few_shot_examples": few_shot,
     }
 
-    log.info(
-        json.dumps(
-            {
-                "event": "workflow_start",
-                "request_id": request_id,
-                "route": task.route,
-                "pattern": "router → sequential pipeline + HITL + feedback retrieval",
-                "few_shot_count": len(few_shot),
-            }
+    with _start_span(
+        "workflow.run",
+        attributes={
+            "request_id": request_id,
+            "workflow.route": ",".join(task.route),
+            "workflow.few_shot_count": len(few_shot),
+        },
+    ) as span:
+        log.info(
+            json.dumps(
+                {
+                    "event": "workflow_start",
+                    "request_id": request_id,
+                    "route": task.route,
+                    "pattern": "router → sequential pipeline + HITL + feedback retrieval",
+                    "few_shot_count": len(few_shot),
+                }
+            )
         )
-    )
 
-    _AGENT_DISPATCH: dict[str, Callable[..., AgentOutput]] = {
-        "data_synthesis_agent": lambda: run_data_synthesis(task, few_shot),
-        "decision_making_agent": lambda: run_decision_making(task, context),
-        "content_outreach_agent": lambda: run_content_outreach(task, context),
-        "compliance_quality_agent": lambda: run_compliance_quality(task, context),
-    }
+        _AGENT_DISPATCH: dict[str, Callable[..., AgentOutput]] = {
+            "data_synthesis_agent": lambda: run_data_synthesis(task, few_shot),
+            "decision_making_agent": lambda: run_decision_making(task, context),
+            "content_outreach_agent": lambda: run_content_outreach(task, context),
+            "compliance_quality_agent": lambda: run_compliance_quality(task, context),
+        }
 
-    loop = asyncio.get_running_loop()
-    for agent_name in task.route:
-        if agent_name == "compliance_quality_agent" and _hitl_gate(task, context):
-            pass
+        loop = asyncio.get_running_loop()
+        for agent_name in task.route:
+            if agent_name == "compliance_quality_agent" and _hitl_gate(task, context):
+                span.set_attribute("workflow.hitl_triggered", True)
 
-        fn = _AGENT_DISPATCH.get(agent_name)
-        if fn is None:
-            result = AgentOutput(
-                request_id=request_id,
-                agent_name=agent_name,
-                status="failed",
-                output={},
-                errors=[f"Unknown agent: {agent_name}"],
-            )
-        else:
-            result = await loop.run_in_executor(
-                None,
-                lambda _fn=fn, _name=agent_name: _timed_agent(_fn, agent_name=_name, request_id=request_id),
-            )
-        context["agent_outputs"].append(result.to_dict())
-        if result.status == "failed":
-            log.error(
-                json.dumps(
-                    {
-                        "event": "workflow_aborted",
-                        "request_id": request_id,
-                        "failed_agent": agent_name,
-                        "reason": "Agent execution failed; halting downstream pipeline",
-                    }
+            fn = _AGENT_DISPATCH.get(agent_name)
+            if fn is None:
+                result = AgentOutput(
+                    request_id=request_id,
+                    agent_name=agent_name,
+                    status="failed",
+                    output={},
+                    errors=[f"Unknown agent: {agent_name}"],
                 )
+            else:
+                result = await loop.run_in_executor(
+                    None,
+                    lambda _fn=fn, _name=agent_name: _timed_agent(_fn, agent_name=_name, request_id=request_id),
+                )
+            context["agent_outputs"].append(result.to_dict())
+            if result.status == "failed":
+                span.set_attribute("workflow.failed_agent", agent_name)
+                if _OTEL_AVAILABLE and Status is not None and StatusCode is not None:
+                    span.set_status(Status(StatusCode.ERROR, f"Agent {agent_name} failed"))
+                log.error(
+                    json.dumps(
+                        {
+                            "event": "workflow_aborted",
+                            "request_id": request_id,
+                            "failed_agent": agent_name,
+                            "reason": "Agent execution failed; halting downstream pipeline",
+                        }
+                    )
+                )
+                break
+
+        if task.human_review_required:
+            context["status"] = "paused_for_human_review"
+        else:
+            context["status"] = "completed"
+
+        span.set_attribute("workflow.agents_run", len(context["agent_outputs"]))
+        span.set_attribute("workflow.status", context["status"])
+        if _OTEL_AVAILABLE and Status is not None and StatusCode is not None and context["status"] != "failed":
+            # Only set OK if we did not already set ERROR above
+            if not any(ao.get("status") == "failed" for ao in context["agent_outputs"]):
+                span.set_status(Status(StatusCode.OK))
+
+        log.info(
+            json.dumps(
+                {
+                    "event": "workflow_complete",
+                    "request_id": request_id,
+                    "agents_run": len(context["agent_outputs"]),
+                    "status": context["status"],
+                }
             )
-            break
-
-    if task.human_review_required:
-        context["status"] = "paused_for_human_review"
-    else:
-        context["status"] = "completed"
-
-    log.info(
-        json.dumps(
-            {
-                "event": "workflow_complete",
-                "request_id": request_id,
-                "agents_run": len(context["agent_outputs"]),
-                "status": context["status"],
-            }
         )
-    )
-    return context
+        return context
 
 
 def run_workflow(user_request: str) -> dict[str, Any]:

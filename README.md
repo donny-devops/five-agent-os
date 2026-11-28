@@ -66,16 +66,19 @@ cd five-agent-os
 
 # 2. Create and activate a virtual environment
 python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+source .venv/bin/activate        # Windows: .venv\\Scripts\\activate
 
 # 3. Install dev dependencies
 pip install ruff pytest
 
-# 4. Run the workflow with the default sample request
+# 4. (Optional) Enable OpenTelemetry spans
+pip install -e '.[observability]'
+
+# 5. Run the workflow with the default sample request
 python -m src.multi_agent_os.orchestrator
 
-# 5. Or pass your own request
-python -m src.multi_agent_os.orchestrator \
+# 6. Or pass your own request
+python -m src.multi_agent_os.orchestrator \\
   --request "Write a LinkedIn post summarizing our Q2 product launches"
 ```
 
@@ -125,7 +128,7 @@ five-agent-os/
 ├── src/multi_agent_os/
 │   ├── models.py                   # TaskPacket, AgentOutput dataclasses
 │   ├── router.py                   # Keyword router with confidence scoring
-│   └── orchestrator.py             # Async pipeline runner with retry + logging
+│   └── orchestrator.py             # Async pipeline runner with retry + logging + OTEL spans
 ├── tests/                          # pytest test suite
 ├── CHANGELOG.md
 ├── CONTRIBUTING.md
@@ -141,6 +144,7 @@ five-agent-os/
 - **Async pipeline** — `run_workflow_async()` backed by `asyncio`; ready for concurrent agent execution
 - **Retry decorator** — exponential back-off on transient failures (3 attempts, 0.5s base delay)
 - **Structured JSON logging** — every agent emit contains `request_id`, `agent`, `status`, `duration_ms`
+- **OpenTelemetry spans** — optional spans around each agent and the full workflow (install the `observability` extra)
 - **Schema versioning** — `SCHEMA_VERSION` stamped on every `TaskPacket`
 - **53 unit + integration tests** across models, router, and orchestrator
 
@@ -150,7 +154,7 @@ five-agent-os/
 
 - [ ] Replace keyword router with a model-based classifier (`confidence_score < 0.8` routes should escalate)
 - [ ] Swap `asyncio.get_event_loop().run_in_executor` for a proper `asyncio.TaskGroup` when agents can run concurrently
-- [ ] Add OpenTelemetry spans around `_timed_agent()`
+- [x] Add OpenTelemetry spans around `_timed_agent()` and the workflow
 - [ ] Connect `AgentOutput` to a persistent store (PostgreSQL, Supabase Postgres, or S3) keyed by `request_id`
 - [ ] Add a dead-letter queue for agents that exceed `max_attempts` in the retry decorator
 - [ ] Add environment-specific policy checks before enabling cloud or database integrations
